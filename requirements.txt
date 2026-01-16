@@ -1,0 +1,19 @@
+# UI Framework
+streamlit>=1.40.0
+
+# AI & Transcription
+openai>=1.50.0
+# pyannote.audio  <-- Uncomment this only if you are ready for heavy AI processing (requires more RAM)
+
+# Audio Processing
+pydub>=0.25.1
+# audioop-lts # Only needed for Python 3.13 (Docker uses 3.11)
+
+# Database & Storage (The "Vault")
+firebase-admin>=6.2.0
+
+# Environment Security
+python-dotenv>=1.0.1
+
+# Utilities
+watchdog>=3.0.0  # Helps Streamlit detect file changes
