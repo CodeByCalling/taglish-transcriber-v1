@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 2000
+enableCORS = false
+enableXsrfProtection = false
+headless = true
+enableWebsocketCompression = false

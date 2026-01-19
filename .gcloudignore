@@ -1,0 +1,17 @@
+.git
+.gitignore
+.dockerignore
+.github
+.vscode
+.idx
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.env
+venv/
+.venv/
+*.mp3
+*.wav
+*.m4a

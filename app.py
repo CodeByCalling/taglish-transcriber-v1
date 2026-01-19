@@ -1,13 +1,16 @@
 import streamlit as st
 import os
 import traceback
+import threading
+import time
+import json
 from dotenv import load_dotenv
 import openai
 from pydub import AudioSegment
 import math
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -58,7 +61,14 @@ def initialize_firebase():
     """
     if not firebase_admin._apps:
         try:
-            cred = credentials.Certificate("serviceAccountKey.json")
+            # Dual Auth Strategy: Local Key vs Cloud Identity
+            if os.path.exists("serviceAccountKey.json"):
+                cred = credentials.Certificate("serviceAccountKey.json")
+            else:
+                # Production: Use Google Cloud Identity (ADC)
+                print("🔑 Using Application Default Credentials (Cloud Run)")
+                cred = credentials.ApplicationDefault()
+                
             firebase_admin.initialize_app(cred, {
                 'storageBucket': BUCKET_NAME 
             })
@@ -86,234 +96,352 @@ def upload_to_firebase(local_path, destination_path):
         st.error(f"Upload failed: {e}")
         return None
 
-def save_metadata(db, filename, context, transcript_text, storage_url):
-    """
-    Saves transcription metadata to Firestore.
-    """
+
+def generate_signed_upload_url(filename, content_type="audio/mpeg"):
+    """Generates a Signed URL for Direct-to-GCS upload."""
     try:
-        doc_ref = db.collection("transcripts").document()
-        doc_ref.set({
-            "filename": filename,
-            "upload_date": datetime.now(),
-            "context_provided": context,
-            "status": "completed",
-            "storage_url": storage_url,
-            "transcript": transcript_text
-        })
-        return doc_ref.id
+        bucket = storage.bucket(name=BUCKET_NAME)
+        blob = bucket.blob(f"uploads/{filename}")
+        
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=15),
+            method="PUT",
+            content_type=content_type
+        )
+        return url, blob.name
     except Exception as e:
-        st.error(f"Firestore save failed: {e}")
-        return None
+        st.error(f"Signed URL Error: {e}")
+        return None, None
 
+def format_timestamp(seconds):
+    """Converts seconds to [MM:SS] format."""
+    minutes = int(seconds // 60)
+    sec = int(seconds % 60)
+    return f"[{minutes:02d}:{sec:02d}]"
 
-def process_chunk(client, file_path, system_prompt, chunk_index, total_chunks):
-    """
-    Transcribes a single audio chunk.
-    """
+def transcribe_segment_with_timestamps(client, file_path, system_prompt, offset_seconds, temperature):
+    """Transcribes a chunk and returns text with global timestamps."""
     try:
         with open(file_path, "rb") as audio_file:
-            st.text(f"  ... Transcribing segment {chunk_index + 1}/{total_chunks} ...")
-            transcript_response = client.audio.transcriptions.create(
+            response = client.audio.transcriptions.create(
                 model="whisper-1", 
                 file=audio_file, 
                 prompt=system_prompt,
-                temperature=0.3
+                temperature=temperature,
+                response_format="verbose_json" # Critical for timestamps
             )
-            return transcript_response.text
-    except Exception as e:
-        st.error(f"Error processing chunk {chunk_index + 1}: {e}")
-        return f"[Missing Segment {chunk_index + 1}]"
-
-def transcribe_audio(file_obj, context_text, model_choice):
-    """
-    Real OpenAI Whisper Integration (v1.x) with Chunking
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        st.error("🚨 OpenAI API Key not found. Please check your .env file.")
-        return None
-    
-    # Critical Fix: Strip whitespace that often creeps in from copy-pasting
-    api_key = api_key.strip()
-
-    client = openai.OpenAI(
-        api_key=api_key,
-        timeout=300.0 # Increase timeout to 5 minutes for large uploads
-    )
-
-    # Construct the Specialized Taglish Query (Anti-Hallucination V2)
-    system_prompt = (
-        "You are an expert transcriber for Taglish (Tagalog-English) church meetings. "
-        "Audio is often noisy. If you hear silence, music, or unclear sounds, DO NOT hallucinate. "
-        "DO NOT REPEAT phrases in a loop. If a phrase repeats more than twice, stop writing it. "
-        "Transcribe English in US English. Transcribe Tagalog in Filipino orthography. "
-        "Context: " + context_text
-    )
-    
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    try:
-        # 1. Save Uploaded File to Disk (Required for Pydub)
-        file_ext = file_obj.name.split('.')[-1]
-        temp_filename = f"temp_upload.{file_ext}"
-        
-        with open(temp_filename, "wb") as f:
-            f.write(file_obj.getbuffer())
             
-        # 2. Check Size and Chunk if necessary
-        status_text.text("Analyzing audio file...")
-        audio = AudioSegment.from_file(temp_filename)
+            segment_text = ""
+            for segment in response.segments:
+                start_time = segment['start'] + offset_seconds
+                text = segment['text'].strip()
+                if text:
+                    ts = format_timestamp(start_time)
+                    segment_text += f"**{ts}** {text}\n\n"
+            
+            return segment_text
+    except Exception as e:
+        print(f"Error in segment: {e}")
+        return f"\n⚠️ [SYSTEM ERROR at {format_timestamp(offset_seconds)}]: {str(e)}\n"
+
+def background_worker(job_id, filename, context, temperature_setting, db):
+    """
+    The function that runs in a separate thread (The 'Plug-Out' Logic).
+    """
+    try:
+        print(f"Starting Background Job {job_id} for {filename}")
+        doc_ref = db.collection("transcripts").document(job_id)
+        doc_ref.update({"status": "processing", "progress": 0, "message": "Starting engine..."})
+
+        # 1. Download from Storage (Direct Upload Location)
+        bucket = storage.bucket(name=BUCKET_NAME)
+        blob = bucket.blob(f"uploads/{filename}")
+        local_filename = f"temp_bg_{filename}"
+        blob.download_to_filename(local_filename)
+        
+        doc_ref.update({"message": "Analyzing audio duration..."})
+        
+        # 2. Analyze & Chunk
+        audio = AudioSegment.from_file(local_filename)
         duration_ms = len(audio)
-        duration_minutes = duration_ms / 1000 / 60
-        
-        st.info(f"Audio Duration: {duration_minutes:.2f} minutes")
-        
-        # Split into 10-minute chunks (10 * 60 * 1000 ms)
-        chunk_length_ms = 10 * 60 * 1000
+        chunk_length_ms = 10 * 60 * 1000 # 10 mins
         chunks = math.ceil(duration_ms / chunk_length_ms)
         
+        # 3. Setup OpenAI
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        client = openai.OpenAI(api_key=api_key)
+        system_prompt = (
+            "You are an expert transcriber for Taglish (Tagalog-English) church meetings. "
+            "Transcribe exactly what is said. "
+            "Context: " + context
+        )
+
         full_transcript = ""
         
+        # 4. Process Loop
         for i in range(chunks):
+            doc_ref.update({
+                "progress": int((i / chunks) * 100),
+                "message": f"Transcribing part {i+1} of {chunks}..."
+            })
+            
             start_ms = i * chunk_length_ms
             end_ms = min((i + 1) * chunk_length_ms, duration_ms)
-            
-            # Export chunk
             chunk = audio[start_ms:end_ms]
-            chunk_filename = f"temp_chunk_{i}.mp3"
-            chunk.export(chunk_filename, format="mp3")
             
-            # Update UI
-            progress = (i / chunks)
-            progress_bar.progress(progress)
-            status_text.text(f"Processing Part {i+1}/{chunks} (sending to OpenAI)...")
+            chunk_name = f"chunk_{job_id}_{i}.mp3"
+            chunk.export(chunk_name, format="mp3")
             
-            # Transcribe
-            chunk_text = process_chunk(client, chunk_filename, system_prompt, i, chunks)
+            # Offset logic
+            offset_seconds = (start_ms / 1000)
+            chunk_text = transcribe_segment_with_timestamps(client, chunk_name, system_prompt, offset_seconds, temperature_setting)
+            full_transcript += chunk_text
             
-            # Anti-Loop: If a chunk is just repeating the same word, discard it or warn.
-            # Simple heuristic: If the text is shorter than 50 chars but audio was 10 mins, it's likely noise.
-            # For now, we trust the new system prompt.
-            
-            full_transcript += chunk_text + "\n\n"
-            
-            # Cleanup Chunk
-            if os.path.exists(chunk_filename):
-                os.remove(chunk_filename)
+            if os.path.exists(chunk_name):
+                os.remove(chunk_name)
         
-        # Cleanup Original
-        if os.path.exists(temp_filename):
-            # UPLOAD TO FIREBASE STORAGE BEFORE DELETING
-            status_text.text("Saving to Cloud Vault...")
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            storage_path = f"meetings/{timestamp}_{file_obj.name}"
-            storage_url = upload_to_firebase(temp_filename, storage_path)
-            
-            # SAVE TO FIRESTORE
-            if db and storage_url:
-                doc_id = save_metadata(db, file_obj.name, context_text, full_transcript, storage_url)
-                st.success(f"✅ Saved to Secure Vault (ID: {doc_id})")
-                st.session_state['refresh_history'] = True # Trigger reload
-            
-            os.remove(temp_filename)
-            
-        progress_bar.progress(100)
-        status_text.text("Transcription Complete!")
+        # 5. Finish
+        doc_ref.update({
+            "status": "completed",
+            "progress": 100,
+            "message": "Done!",
+            "transcript": full_transcript
+        })
         
-        return full_transcript
-        
+        if os.path.exists(local_filename):
+            os.remove(local_filename)
+            
+        print(f"Job {job_id} Completed Success.")
+
     except Exception as e:
-        st.error(f"An error occurred during transcription: {e}")
-        st.code(traceback.format_exc()) # Show full traceback
-        return None
+        error_msg = f"Background Job Failed: {e}"
+        print(error_msg)
+        traceback.print_exc()
+        # Try to update DB with error
+        try:
+            doc_ref.update({"status": "error", "message": str(e)})
+        except:
+            pass
+
+# --- UI Layout ---
 
 # --- UI Layout ---
 
 # Sidebar
 with st.sidebar:
     st.header("Settings")
-    model_choice = st.selectbox(
-        "Model", 
-        ["whisper-1 (High Accuracy)", "whisper-1 (Standard)"], 
-        index=0
-    )
-    speaker_count = st.number_input("Est. Speakers", min_value=1, value=4)
+    model_labels = ["whisper-1 (High Accuracy)", "whisper-1 (Fast/Creative)"]
+    model_selection = st.selectbox("Model", model_labels, index=0)
+    
+    # Map selection to temperature
+    temp_map = {
+        "whisper-1 (High Accuracy)": 0.0,
+        "whisper-1 (Fast/Creative)": 0.4
+    }
+    selected_temp = temp_map[model_selection]
     
     st.divider()
     st.subheader("History")
-    
-    # HISTORY FETCH LOGIC
+
+    # History Logic
     if db:
-        docs = db.collection("transcripts").order_by("upload_date", direction=firestore.Query.DESCENDING).limit(10).stream()
-        
-        found_any = False
-        for doc in docs:
-            found_any = True
+        history_docs = db.collection("transcripts").order_by("upload_date", direction=firestore.Query.DESCENDING).limit(10).stream()
+        for doc in history_docs:
             data = doc.to_dict()
-            date_str = data.get('upload_date', datetime.now()).strftime("%b %d %H:%M")
             fname = data.get('filename', 'Unknown File')
+            status = data.get('status', 'unknown')
+            upload_date = data.get('upload_date')
+            date_str = upload_date.strftime("%Y-%m-%d %H:%M") if upload_date else "Unknown Date"
             
-            with st.expander(f"{date_str} - {fname[:15]}..."):
-                st.caption(f"Status: {data.get('status')}")
-                # Download Button for History Item
-                st.download_button(
-                    label="Download",
-                    data=data.get('transcript', ''),
-                    file_name=f"transcript_{doc.id}.txt",
-                    mime="text/plain",
-                    key=doc.id
-                )
-        
-        if not found_any:
-            st.caption("No transcripts found in Cloud.")
-    else:
-        st.caption("Database disconnected.")
+            with st.expander(f"{date_str} - {fname}"):
+                st.caption(f"Status: {status}")
+                
+                col_h1, col_h2 = st.columns(2)
+                
+                with col_h1:
+                    if status == 'completed':
+                        st.download_button("Download", data.get('transcript', ''), file_name=f"{fname}.txt", key=f"dl_{doc.id}")
+                    elif status == 'processing':
+                         st.progress(data.get('progress', 0))
+                         if st.button("Track", key=f"track_{doc.id}"):
+                            st.session_state['job_id'] = doc.id
+                            st.rerun()
+                
+                with col_h2:
+                    if st.button("🗑️ Delete", key=f"del_{doc.id}"):
+                        db.collection("transcripts").document(doc.id).delete()
+                        # If we just deleted the active job, reset state
+                        if st.session_state.get('job_id') == doc.id:
+                            del st.session_state['job_id']
+                        st.rerun()
 
-# Top Navigation
-col1, col2 = st.columns([8, 1])
-with col1:
-    st.title("🇵🇭 Taglish Transcriber")
-with col2:
-    st.caption("Profile")
+# --- Main UI Functions ---
 
-# Main Canvas (State 1: Setup)
-st.markdown("### Upload Church Meeting Recording")
-
-# Context Box
-context_input = st.text_area(
-    "Meeting Context & Vocabulary",
-    placeholder="Example: Budget planning, 'Tithe', 'Gawain', Pastor John, Vallejo campus...",
-    help="Helping the AI know these words improves Tagalog spelling"
-)
-
-# Drop Zone
-uploaded_file = st.file_uploader(
-    "Drag & Drop MP3, WAV, or M4A here", 
-    type=["mp3", "wav", "m4a"],
-    help="Max 500MB (System will auto-chunk)"
-)
-
-
-if uploaded_file is not None:
-    # State 2: Processing (Simulated)
-    st.divider()
-    st.markdown("### ⚙️ Processing...")
+def render_upload_ui():
+    st.markdown("### 1. Direct-to-Cloud Upload")
+    context_input = st.text_area("Meeting Context", placeholder="Budget, Tithe, Pastor John...")
     
-    # Trigger Transcription Button (for Phase 1 testing)
-    if st.button("Start Transcription"):
-        transcript = transcribe_audio(uploaded_file, context_input, model_choice)
+    # Step 1: Define Filename
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        filename_input = st.text_input("Target Filename (Optional)", placeholder="MyMeeting")
+    with col2:
+         st.text(" ") # Spacer
+    
+    if st.button("Generate Secure Link 🔗"):
+        # Auto-Name Logic
+        final_filename = filename_input.strip()
         
-        if transcript:
-            # State 3: Output
-            st.divider()
-            st.subheader("Transcript Preview")
-            st.write(transcript)
+        # 1. Handle Empty Input -> Timestamped Filename
+        if not final_filename:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            final_filename = f"recording_{timestamp}.mp3"
+        
+        # 2. Handle Missing Extension -> Append .mp3
+        elif "." not in final_filename:
+            final_filename += ".mp3"
             
-            # Download Button
-            st.download_button(
-                label="Download Transcript",
-                data=transcript,
-                file_name="transcript.txt",
-                mime="text/plain"
-            )
+        # 3. Handle Existing Extension (Respect User Choice)
+        # (No change needed, if they typed meeting.m4a, we keep it)
+
+        # Detect Mime (for the Browser Upload)
+        mime_type = "audio/mpeg" 
+        if final_filename.lower().endswith(".m4a"):
+            mime_type = "audio/mp4"
+        elif final_filename.lower().endswith(".wav"):
+           mime_type = "audio/wav"
+
+        signed_url, blob_name = generate_signed_upload_url(final_filename, content_type=mime_type)
+        
+        if signed_url:
+            st.success(f"Ready to upload: {final_filename}")
+            st.session_state['signed_url'] = signed_url
+            st.session_state['target_filename'] = final_filename
+            st.session_state['blob_name'] = blob_name
+            st.session_state['mime_type'] = mime_type
+
+    # Step 2: HTML Upload
+    if 'signed_url' in st.session_state:
+        st.markdown(f"**Target:** `{st.session_state['target_filename']}`")
+        
+        # JS Uploader
+        html_code = f"""
+        <html>
+        <body>
+            <input type="file" id="fileInput" />
+            <button onclick="uploadFile()">⬆️ Upload Now</button>
+            <div id="status"></div>
+            <progress id="progressBar" value="0" max="100" style="width:100%; display:none;"></progress>
+            
+            <script>
+            function uploadFile() {{
+                var fileInput = document.getElementById('fileInput');
+                if (fileInput.files.length === 0) {{
+                    document.getElementById('status').innerText = '⚠️ Please select a file first!';
+                    return;
+                }}
+                var file = fileInput.files[0];
+                var url = "{st.session_state['signed_url']}";
+                var serverMime = "{st.session_state['mime_type']}"; 
+                
+                var xhr = new XMLHttpRequest();
+                xhr.upload.onprogress = function(e) {{
+                    if (e.lengthComputable) {{
+                        var percentComplete = (e.loaded / e.total) * 100;
+                        document.getElementById('progressBar').value = percentComplete;
+                        document.getElementById('progressBar').style.display = 'block';
+                        document.getElementById('status').innerText = 'Uploading: ' + Math.round(percentComplete) + '%';
+                    }}
+                }};
+                xhr.onload = function() {{
+                    if (xhr.status == 200 || xhr.status == 201) {{
+                        document.getElementById('status').innerHTML = '✅ <b>Upload Complete!</b><br>👇 Now click <b>Start Transcription</b> below.';
+                    }} else {{
+                        document.getElementById('status').innerText = '❌ Error: ' + xhr.status + ' (' + xhr.statusText + ')';
+                    }}
+                }};
+                xhr.open("PUT", url, true);
+                xhr.setRequestHeader("Content-Type", serverMime); 
+                xhr.send(file);
+            }}
+            </script>
+        </body>
+        </html>
+        """
+        st.components.v1.html(html_code, height=150)
+        
+        st.markdown("### 2. Start Intelligence Engine")
+        if st.button("🚀 Start Transcription"):
+            bucket = storage.bucket(name=BUCKET_NAME)
+            blob = bucket.blob(st.session_state['blob_name'])
+            
+            if blob.exists():
+                job_id = f"job_{int(time.time())}"
+                st.session_state['job_id'] = job_id
+                
+                # Create Init Doc
+                db.collection("transcripts").document(job_id).set({
+                    "filename": st.session_state['target_filename'],
+                    "upload_date": datetime.now(),
+                    "status": "queued",
+                    "progress": 0,
+                    "message": "Queued context...",
+                    "context_provided": context_input
+                })
+                
+                # Spawn Thread
+                thread = threading.Thread(
+                    target=background_worker, 
+                    args=(job_id, st.session_state['target_filename'], context_input, selected_temp, db)
+                )
+                thread.start()
+                st.rerun()
+            else:
+                st.error("File not found in cloud. Did you finish uploading?")
+
+def render_monitor_ui(job_id):
+    st.info(f"Monitoring Job: {job_id}")
+    
+    if st.button("Start New Upload"):
+        del st.session_state['job_id']
+        if 'signed_url' in st.session_state: del st.session_state['signed_url']
+        st.rerun()
+    
+    # Poll Firestore
+    doc_ref = db.collection("transcripts").document(job_id)
+    doc = doc_ref.get()
+    
+    if doc.exists:
+        data = doc.to_dict()
+        status = data.get('status', 'unknown')
+        progress = data.get('progress', 0)
+        msg = data.get('message', '')
+        
+        st.subheader(f"Status: {status.upper()}")
+        st.progress(progress)
+        st.text(f"Log: {msg}")
+        
+        if status == 'completed':
+            st.success("Analysis Finished!")
+            st.text_area("Transcript", data.get('transcript', ''), height=400)
+            st.download_button("Download Text", data.get('transcript', ''), file_name="final.txt")
+        elif status == 'error':
+            st.error(f"Failed: {msg}")
+    else:
+        st.warning("Job not found in database. It might have been deleted.")
+        if st.button("Back to Home"):
+            del st.session_state['job_id']
+            st.rerun()
+    
+    time.sleep(2)
+    st.rerun()
+
+# --- Main Canvas ---
+st.title("🇵🇭 Taglish Transcriber (Async)")
+st.caption("Auto-Chunking • No Size Limits • Timestamped")
+
+if 'job_id' not in st.session_state:
+    render_upload_ui()
+else:
+    render_monitor_ui(st.session_state['job_id'])

@@ -20,4 +20,5 @@ gcloud run deploy taglish-transcriber-v1 \
   --set-env-vars OPENAI_API_KEY=$OPENAI_API_KEY \
   --memory 4Gi \
   --cpu 2 \
-  --timeout 60m
+  --timeout 5m \
+  --no-cpu-throttling

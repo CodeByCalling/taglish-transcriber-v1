@@ -1,9 +1,11 @@
 # Use Python 3.11 Full (Includes compiler tools like gcc)
 FROM python:3.11
 
-# Install System Dependencies (FFmpeg is critical for pydub)
+# Install System Dependencies (FFmpeg + Nginx)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    nginx \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Working Directory
@@ -19,5 +21,5 @@ COPY . .
 # Expose Port 8080 (Cloud Run Requirement)
 EXPOSE 8080
 
-# Run Streamlit
-CMD ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0", "--server.maxUploadSize=1000"]
+# Run Streamlit Directly
+CMD ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0"]
