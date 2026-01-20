@@ -18,7 +18,9 @@ gcloud run deploy taglish-transcriber-v1 \
   --allow-unauthenticated \
   --set-env-vars APP_PASSWORD=$APP_PASSWORD \
   --set-env-vars OPENAI_API_KEY=$OPENAI_API_KEY \
-  --memory 4Gi \
-  --cpu 2 \
-  --timeout 5m \
-  --no-cpu-throttling
+  --memory 8Gi \
+  --cpu 4 \
+  --timeout 60m \
+  --no-cpu-throttling \
+  --max-instances 3
+

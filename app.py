@@ -134,8 +134,8 @@ def transcribe_segment_with_timestamps(client, file_path, system_prompt, offset_
             
             segment_text = ""
             for segment in response.segments:
-                start_time = segment['start'] + offset_seconds
-                text = segment['text'].strip()
+                start_time = segment.start + offset_seconds
+                text = segment.text.strip()
                 if text:
                     ts = format_timestamp(start_time)
                     segment_text += f"**{ts}** {text}\n\n"
@@ -148,25 +148,55 @@ def transcribe_segment_with_timestamps(client, file_path, system_prompt, offset_
 def background_worker(job_id, filename, context, temperature_setting, db):
     """
     The function that runs in a separate thread (The 'Plug-Out' Logic).
+    Now with streaming chunks and keepalive heartbeat for Cloud Run.
     """
     try:
         print(f"Starting Background Job {job_id} for {filename}")
         doc_ref = db.collection("transcripts").document(job_id)
-        doc_ref.update({"status": "processing", "progress": 0, "message": "Starting engine..."})
+        doc_ref.update({
+            "status": "processing", 
+            "progress": 0, 
+            "message": "Starting engine...",
+            "last_heartbeat": datetime.now()
+        })
 
         # 1. Download from Storage (Direct Upload Location)
         bucket = storage.bucket(name=BUCKET_NAME)
         blob = bucket.blob(f"uploads/{filename}")
         local_filename = f"temp_bg_{filename}"
+        
+        # Detect original file format
+        original_format = "mp3"  # default
+        if filename.lower().endswith(".m4a"):
+            original_format = "m4a"
+        elif filename.lower().endswith(".wav"):
+            original_format = "wav"
+        
+        doc_ref.update({"message": "Downloading from cloud storage..."})
         blob.download_to_filename(local_filename)
         
-        doc_ref.update({"message": "Analyzing audio duration..."})
+        doc_ref.update({"message": "Analyzing audio file..."})
         
-        # 2. Analyze & Chunk
-        audio = AudioSegment.from_file(local_filename)
-        duration_ms = len(audio)
-        chunk_length_ms = 10 * 60 * 1000 # 10 mins
+        # 2. Get audio metadata WITHOUT loading entire file into memory
+        # Use pydub's lightweight probe first
+        try:
+            from pydub.utils import mediainfo
+            info = mediainfo(local_filename)
+            duration_ms = float(info.get('duration', 0)) * 1000  # Convert to milliseconds
+        except Exception as e:
+            # Fallback: Load just to get duration then release memory
+            print(f"Mediainfo failed, using fallback: {e}")
+            audio_temp = AudioSegment.from_file(local_filename)
+            duration_ms = len(audio_temp)
+            del audio_temp  # Release memory immediately
+        
+        chunk_length_ms = 10 * 60 * 1000  # 10 mins
         chunks = math.ceil(duration_ms / chunk_length_ms)
+        
+        doc_ref.update({
+            "message": f"File duration: {int(duration_ms/1000/60)} minutes. Processing {chunks} chunks...",
+            "total_chunks": chunks
+        })
         
         # 3. Setup OpenAI
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -179,36 +209,53 @@ def background_worker(job_id, filename, context, temperature_setting, db):
 
         full_transcript = ""
         
-        # 4. Process Loop
+        # 4. Process Loop - Load and process ONE chunk at a time
         for i in range(chunks):
+            # Update heartbeat to keep Cloud Run alive
             doc_ref.update({
                 "progress": int((i / chunks) * 100),
-                "message": f"Transcribing part {i+1} of {chunks}..."
+                "message": f"Transcribing chunk {i+1} of {chunks}...",
+                "last_heartbeat": datetime.now()
             })
             
             start_ms = i * chunk_length_ms
             end_ms = min((i + 1) * chunk_length_ms, duration_ms)
-            chunk = audio[start_ms:end_ms]
             
-            chunk_name = f"chunk_{job_id}_{i}.mp3"
-            chunk.export(chunk_name, format="mp3")
+            # Load ONLY this chunk into memory
+            audio_chunk = AudioSegment.from_file(local_filename)[start_ms:end_ms]
             
-            # Offset logic
+            # Preserve original format - no conversion needed
+            chunk_name = f"chunk_{job_id}_{i}.{original_format}"
+            audio_chunk.export(chunk_name, format=original_format)
+            
+            # Release chunk from memory immediately
+            del audio_chunk
+            
+            # Offset logic for global timestamps
             offset_seconds = (start_ms / 1000)
-            chunk_text = transcribe_segment_with_timestamps(client, chunk_name, system_prompt, offset_seconds, temperature_setting)
+            chunk_text = transcribe_segment_with_timestamps(
+                client, chunk_name, system_prompt, offset_seconds, temperature_setting
+            )
             full_transcript += chunk_text
             
+            # Clean up chunk file
             if os.path.exists(chunk_name):
                 os.remove(chunk_name)
+            
+            # Periodic save to Firestore (every 5 chunks) for crash recovery
+            if (i + 1) % 5 == 0:
+                doc_ref.update({"transcript": full_transcript})
         
         # 5. Finish
         doc_ref.update({
             "status": "completed",
             "progress": 100,
             "message": "Done!",
-            "transcript": full_transcript
+            "transcript": full_transcript,
+            "last_heartbeat": datetime.now()
         })
         
+        # Clean up downloaded file
         if os.path.exists(local_filename):
             os.remove(local_filename)
             
@@ -220,7 +267,11 @@ def background_worker(job_id, filename, context, temperature_setting, db):
         traceback.print_exc()
         # Try to update DB with error
         try:
-            doc_ref.update({"status": "error", "message": str(e)})
+            doc_ref.update({
+                "status": "error", 
+                "message": str(e),
+                "last_heartbeat": datetime.now()
+            })
         except:
             pass
 
