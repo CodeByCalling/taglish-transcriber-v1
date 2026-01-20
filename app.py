@@ -115,10 +115,11 @@ def generate_signed_upload_url(filename, content_type="audio/mpeg"):
         return None, None
 
 def format_timestamp(seconds):
-    """Converts seconds to [MM:SS] format."""
-    minutes = int(seconds // 60)
+    """Converts seconds to [H:MM:SS] format for audio player compatibility."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
     sec = int(seconds % 60)
-    return f"[{minutes:02d}:{sec:02d}]"
+    return f"[{hours}:{minutes:02d}:{sec:02d}]"
 
 def transcribe_segment_with_timestamps(client, file_path, system_prompt, offset_seconds, temperature):
     """Transcribes a chunk and returns text with global timestamps."""
