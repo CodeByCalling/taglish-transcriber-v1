@@ -7,7 +7,7 @@ openai>=1.50.0
 
 # Audio Processing
 pydub>=0.25.1
-# audioop-lts # Only needed for Python 3.13 (Docker uses 3.11)
+audioop-lts>=0.2.0 # Required for pydub on Python 3.13+
 
 # Database & Storage (The "Vault")
 firebase-admin>=6.2.0
